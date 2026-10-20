@@ -1,0 +1,14 @@
+﻿# 构建产物
+build/
+*.map
+
+# 编辑器
+.vscode/ipch/
+
+# 打包/临时文件
+*.zip
+*.7z
+
+# 系统
+Thumbs.db
+desktop.ini

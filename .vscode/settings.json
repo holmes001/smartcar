@@ -1,0 +1,7 @@
+{
+    "editor.fontSize": 16,
+    // 使用 GNU ARM 工具链（toolchainFile），不需要 MSVC 开发者环境。
+    // 关闭后 CMake Tools 不会再尝试探测 cl.exe，从而消除
+    // "No architecture specified for cl.exe" / "Compiler cl.exe ... was not found" 提示。
+    "cmake.useVsDeveloperEnvironment": "never"
+}

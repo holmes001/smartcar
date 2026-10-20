@@ -1,0 +1,49 @@
+﻿{
+    // ==========================================================================
+    //  浠诲姟 鈥斺€?stm32_HAL/smartcar 锛圫TM32H750锛屼骇鐗╁悕鏄?smartcar.elf锛?    // --------------------------------------------------------------------------
+    //  娉ㄦ剰锛欵LF 鍚嶆槸 CMake 宸ョ▼鍚?smartcar锛屽拰鐩綍鍚?smartcar 涓嶄竴鑷淬€?    //
+    //  鈽?H7 闇€瑕佹樉寮?"-c transport select swd"銆?    //
+    //  鈽?adapter speed 蹇呴』鍐欏湪 "-f target/stm32h7x.cfg" **涔嬪悗**锛?    //    target 鑴氭湰閲屾湁 "adapter speed 4000"锛屽啓鍦ㄥ墠闈細琚畠瑕嗙洊鎺夈€?    //
+    //  鈽?閫熷害閫夋嫨锛堟湰鏉?+ ST-Link V2 鍏嬮殕鐗堝疄娴嬶級锛?    //      100 kHz  鈫?鑳界儳浣嗘瀬鎱紝鍐?88KB Flash 瑕佸嚑鍗佺锛岃€屼笖瀹规槗瓒呮椂澶辫触
+    //      480 kHz  鈫?绋冲畾閫氳繃锛堝綋鍓嶅€硷級
+    //      950/1000 鈫?SWD 涓嶇ǔ瀹氾紝鍐?Flash 绠楁硶宸ヤ綔鍖猴紙0x2000xxxx锛孌TCM锛夋椂
+    //                 鎶?"Failed to write memory at 0x2000xxxx" 缂栫▼澶辫触
+    //    濡傛灉 480 杩樺け璐ワ紝寰€涓嬮€€鍒?240銆?    // ==========================================================================
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build", "${workspaceFolder}/build/Debug",
+                "--config", "Debug",
+                "--",
+                "-j4"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": [ "$gcc" ],
+            "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+        },
+        {
+            "label": "download",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f", "interface/stlink.cfg",
+                "-c", "transport select swd",
+                "-f", "target/stm32h7x.cfg",
+                "-c", "adapter speed 480",
+                // Flash 绠楁硶鐨勫伐浣滃尯浠庨粯璁ょ殑 DTCM(0x20000000) 鎸埌 AXI SRAM 鏈熬銆?                // 榛樿鍊间細璁?OpenOCD 鎶婄畻娉曞啓杩?DTCM锛屾湰鏉?+ ST-Link 鍏嬮殕鐗堜笅
+                // 缁忓父鎶?"Failed to write memory at 0x20000b74"銆?                "-c", "stm32h7x.cpu0 configure -work-area-phys 0x24070000 -work-area-size 0x10000 -work-area-backup 0",
+                "-c", "program build/Debug/smartcar.elf verify reset exit"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": [ "build" ],
+            "group": { "kind": "build" },
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+        }
+    ]
+}

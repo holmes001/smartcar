@@ -1,0 +1,19 @@
+﻿{
+    // gdb / objdump 璺緞鐢辩敤鎴疯缃粺涓€鎻愪緵锛坈ortex-debug.gdbPath.windows
+    // = D:\software\msys64\ucrt64\bin\gdb-multiarch.exe锛夈€?    // 鍘?"gdbPath"/"objdumpPath" 鎸囧悜宸蹭笉瀛樺湪鐨?E:\msys64锛屽凡鍒犻櫎銆?    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug STM32",
+            "type": "cortex-debug",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "servertype": "openocd",
+            "executable": "./build/Debug/smartcar.elf",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32h7x.cfg"
+            ],
+            "showDevDebugOutput": "raw"
+        }
+    ]
+}
