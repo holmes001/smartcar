@@ -106,7 +106,7 @@ const chassis_config_t CHASSIS_CASCADE_CONFIG =
     .right_comp_limit_mm_s  = 400.0f,   /* 单位 mm/s */
 
     .yaw_kp                 = 2.5f,
-    .yaw_ki                 = 2.0f,
+    .yaw_ki                 = 0.0f,
     .yaw_kd                 = 0.0f,
     .yaw_integral_limit     = 1.0f,
     .yaw_output_ratio       = 0.5f,
@@ -353,7 +353,7 @@ void Chassis_UpdateOuter(float lateral_error_norm, float dt_s)
      * ω_ref > 0（车需要右转）时：左轮加速、右轮减速。
      * 右轮额外叠加 right_comp_mm_s —— 用来补偿左右两侧的不对称。 */
     s_wheel_target[MOTOR_L] = s_cfg.base_speed_mm_s - delta_v;
-    s_wheel_target[MOTOR_R] = s_cfg.base_speed_mm_s + s_cfg.right_comp_mm_s + delta_v;
+    s_wheel_target[MOTOR_R] = s_cfg.base_speed_mm_s - s_cfg.right_comp_mm_s + delta_v;
 
     /* 外环跑过一轮，说明车在正常循迹，允许内环开始输出 */
     s_inner_enabled = 1U;
