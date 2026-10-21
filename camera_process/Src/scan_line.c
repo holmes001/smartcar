@@ -346,8 +346,59 @@ int zebra_detect(struct lineinfo_s *lineinfo, uint8_t *edge_store, uint8_t *inpu
 
 
 /* ========================================================================== */
-/*                    道路中心线加权最小二乘二次拟合（新增）                     */
+/*          道路中心线拟合：离散正交多项式（三项递推）+ 加权内积投影            */
 /* ========================================================================== */
+/*
+ * 为什么改成"正交基 + 内积投影"，而不是直接解正规方程
+ * ---------------------------------------------------------------------------
+ * 目标函数完全一样：
+ *      min Σ w_i·(x_i − p(t_i))² ,  p(t) = a + b·t + c·t²
+ * 最小二乘解唯一，所以**两种做法的答案在数学上是同一个点**。
+ * 差别在"怎么求"，以及"求不出来的时候怎么办"。
+ *
+ * 【直接法】未知量是幂基系数 (a,b,c)，正规方程为
+ *      G·[a b c]ᵀ = [s0 s1 s2]ᵀ ,   G_jk = Σ w·t^(j+k),  s_k = Σ w·x·t^k
+ * G 是 Hankel 矩阵，条件数只由数据跨度决定：
+ *      t ∈ [-1,1]（满幅）        κ ≈ 5.8      —— 很好
+ *      t ∈ [0, 0.6]（只剩远端）  κ ≈ 1e4      —— float32 只剩 3 位有效数字
+ * 更麻烦的是"退化判断"：det 会随跨度变窄**连续趋近** 0 但永远不为 0，
+ * 多小才算退化只能拍一个**有量纲**的绝对阈值（旧代码是 1e-6）。
+ * 直角弯近端丢线、只剩远端十几行时，det 正好在这个量级附近来回跳，
+ * 于是同一场景一帧解得出来、一帧解出个曲率上百的怪抛物线 —— 车就在那抖。
+ *
+ * 【正交法】先正交化再投影。对加权离散内积
+ *      <f,g> = Σ w_i·f(t_i)·g(t_i)
+ * 用三项递推生成（Stieltjes 正交化，不需要知道样本分布）：
+ *      p0 = 1
+ *      p1 = (t − α1)·p0                 α1 = <t·p0,p0>/<p0,p0>
+ *      p2 = (t − α2)·p1 − β2·p0         α2 = <t·p1,p1>/<p1,p1>
+ *                                       β2 = <p1,p1>/<p0,p0>
+ * 满足 <p_j,p_k> = 0 (j ≠ k)。于是正规方程**对角化**，系数就是一个投影：
+ *      c_k = <x,p_k> / <p_k,p_k>
+ * 没有矩阵、没有 Cramer 展开、没有 det，只有内积和一次除法。
+ *
+ * 三个实际收益：
+ *   1. **降阶有客观依据**：<p_k,p_k> 就是"第 k 阶有没有被数据撑住"。
+ *      跨度不足时它连续趋于 0，用**相对**门限 VISION_FIT_ORTHO_MIN_REL
+ *      判"这阶解不出来"，然后退回低一阶 —— 而不是输出天文数字。
+ *      （实测：满幅 0.0922、半幅 0.0058、1/3 幅 0.00075，见 vision_types.h）
+ *   2. **数值稳定**：正交基下 G 是对角阵，条件数归一到 1，float32 的有效
+ *      位数不再被 κ 吃掉；跨度变窄只影响范数大小，不影响解的精度。
+ *   3. **可扩展**：要加三次/四次（贴透视畸变）只是多跑一趟递推，不用重写
+ *      解方程；每一阶还天然给出"消掉了多少残差平方和"。
+ *
+ * 代价：按阶数多扫几遍样本（2 阶 = 3 遍）。样本最多 115 个、每遍约 5 次
+ * 浮点运算，合计 ~1700 次，与旧的 Cramer 展开同量级；480 MHz + FPU 下
+ * 是微秒级，对 30 Hz 帧率无影响。
+ *
+ * 换回幂基（path_fit / Vision_EvalPathFit 对外仍是 a + b·t + c·t²）：
+ *      p1 = t − α1
+ *      p2 = t² − (α1+α2)·t + (α1·α2 − β2)
+ *   => c = c2
+ *      b = c1 − c2·(α1 + α2)
+ *      a = c0 − c1·α1 + c2·(α1·α2 − β2)
+ * 纯代数整理，误差在 float32 舍入量级（< 1e-4 px）。
+ */
 
 /** @brief 权重衰减系数：w = 1/(1 + k·|t|)，k = 0.6 时端点权重 0.625 */
 #define FIT_WEIGHT_K        (0.6f)
@@ -358,192 +409,252 @@ int zebra_detect(struct lineinfo_s *lineinfo, uint8_t *edge_store, uint8_t *inpu
 /** @brief 行坐标归一化尺度 = 半幅高度（t 覆盖 -1 ~ +1） */
 #define FIT_T_SCALE         ((float)VISION_IMG_HEIGHT * 0.5f)
 
+/** @brief 单帧参与拟合的最大样本数（= 扫线区间长度，一个 buf 装得下） */
+#define FIT_MAX_SAMPLES     (VISION_IMG_HEIGHT)
+
 /** @brief 中心线拟合结果的**定义**（extern 声明在 vision_types.h） */
 struct path_fit_s path_fit;
 
-/** @brief 每行参与拟合的权重（第二遍会把离群行清 0） */
-static float s_fit_weight[VISION_IMG_HEIGHT];
-
-/** @brief 每行参与拟合的中心列 */
-static float s_fit_x[VISION_IMG_HEIGHT];
-
-/** @brief 每行是否可参与拟合 */
-static uint8_t s_fit_ok[VISION_IMG_HEIGHT];
-
-/** @brief 每行相对直线拟合的绝对残差（缓存下来避免重复计算） */
-static float s_fit_resid[VISION_IMG_HEIGHT];
+/* 采样缓存：只放"有效行"，压缩成 t/x/w 三组样本。
+ * 3×120×4 = 1440 B，比改动前的 weight/x/ok/resid(≈1.56 KB) 还小一点。
+ * 之所以先压缩再拟合：稀疏有效行（直角弯常见只剩 20~40 行）不必再为整幅图
+ * 维护"这行有没有效"的标记数组，拟合函数也能脱离图像单独测试。 */
+static float   s_fit_t[FIT_MAX_SAMPLES];    /**< 归一化行坐标 t */
+static float   s_fit_x[FIT_MAX_SAMPLES];    /**< 该行中心列 */
+static float   s_fit_w[FIT_MAX_SAMPLES];    /**< 该行权重（离群行被清 0） */
+static uint8_t s_fit_n;                     /**< 样本个数 */
 
 /**
- * @brief  用当前权重解一次 3x3 正规方程
- * @param  abc   输出二次多项式系数 a, b, c
- * @param  n_out 输出实际参与拟合的行数（可为 0）
- * @retval 1 成功；0 有效行不足或矩阵奇异
- * @note   解的是加权最小二乘的正规方程：
- *             [s0 s1 s2][a]   [t0]
- *             [s1 s2 s3][b] = [t1]     sk = Σ w·t^k , tk = Σ w·t^k·x
- *             [s2 s3 s4][c]   [t2]
- *         因为 t 归一化到 [-1,1]，s0~s4 都在同一量级，float32 足够。
+ * @brief  把拟合结果复位成"无效"状态
+ * @param  rows 报告的有效行数
+ * @note   无效时 x_ctrl / x_look 都退回图像中心：即使丢线，控制层拿到的也是
+ *         0 偏差，而不是一个离谱的跳变。
  */
-static uint8_t Fit_SolveOnce(float abc[3], uint8_t *n_out)
+static void Fit_ResetInvalid(uint8_t rows)
 {
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f, s4 = 0.0f;
-    float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f;
-    float det;
-    uint8_t n = 0U;
-    int row;
-
-    for (row = VISION_BASE_LINE; row < VISION_FORWARD_FAR; row++)
-    {
-        float w = s_fit_weight[row];
-        float t, x, t2v;
-
-        if ((w <= 0.0f) || (s_fit_ok[row] == 0U))
-        {
-            continue;
-        }
-
-        t   = ((float)row - FIT_T_CENTER) / FIT_T_SCALE;
-        x   = s_fit_x[row];
-        t2v = t * t;
-
-        s0 += w;
-        s1 += w * t;
-        s2 += w * t2v;
-        s3 += w * t2v * t;
-        s4 += w * t2v * t2v;
-        t0 += w * x;
-        t1 += w * t * x;
-        t2 += w * t2v * x;
-        n++;
-    }
-
-    if (n_out != 0)
-    {
-        *n_out = n;
-    }
-    if (n < VISION_FIT_MIN_ROWS)
-    {
-        return 0U;
-    }
-
-    /* Cramer 法则，3x3 直接展开 */
-    det = (s0 * ((s2 * s4) - (s3 * s3)))
-        - (s1 * ((s1 * s4) - (s3 * s2)))
-        + (s2 * ((s1 * s3) - (s2 * s2)));
-
-    if ((det < 1.0e-6f) && (det > -1.0e-6f))
-    {
-        return 0U;      /* 奇异：所有行几乎落在同一个 t 上 */
-    }
-
-    abc[0] = ((t0 * ((s2 * s4) - (s3 * s3)))
-            - (s1 * ((t1 * s4) - (s3 * t2)))
-            + (s2 * ((t1 * s3) - (s2 * t2)))) / det;
-
-    abc[1] = ((s0 * ((t1 * s4) - (s3 * t2)))
-            - (t0 * ((s1 * s4) - (s3 * s2)))
-            + (s2 * ((s1 * t2) - (t1 * s2)))) / det;
-
-    abc[2] = ((s0 * ((s2 * t2) - (t1 * s3)))
-            - (s1 * ((s1 * t2) - (t1 * s2)))
-            + (t0 * ((s1 * s3) - (s2 * s2)))) / det;
-
-    return 1U;
+    path_fit.a          = (float)VISION_IMG_CX;
+    path_fit.b          = 0.0f;
+    path_fit.c          = 0.0f;
+    path_fit.x_ctrl     = (float)VISION_IMG_CX;
+    path_fit.x_look     = (float)VISION_IMG_CX;
+    path_fit.slope_ctrl = 0.0f;
+    path_fit.resid_rms  = 0.0f;
+    path_fit.t_span     = 0.0f;
+    path_fit.order      = 0U;
+    path_fit.rows_used  = rows;
+    path_fit.valid      = 0U;
 }
 
-/**
- * @brief  用当前权重解一次**加权直线**最小二乘  x(t) = a + b·t
- * @param  ab    输出 a, b
- * @param  n_out 输出实际参与的行数
- * @retval 1 成功；0 有效行不足或矩阵奇异
- * @note   直线只有 2 个自由度，是本模块**第二层防御**的基石：
- *         一段连续的坏行只能把直线整体倾斜，不能把它"弯折"，
- *         所以直线的残差能可靠暴露坏行，不会出现二次曲线那种掩蔽效应。
- */
-static uint8_t Fit_SolveLineOnce(float ab[2], uint8_t *n_out)
+uint8_t Vision_FitPoly(const float *t, const float *x, const float *w,
+                       uint8_t n, uint8_t order, struct path_poly_s *out)
 {
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, t0 = 0.0f, t1 = 0.0f;
-    float det;
-    uint8_t n = 0U;
-    int row;
+    float n0 = 0.0f, n1 = 0.0f, n2 = 0.0f;   /* <p_k,p_k> 三个范数               */
+    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f;   /* <x,p_k>   三个投影              */
+    float sum_t = 0.0f;                      /* <t·p0,p0>，算 α1 用             */
+    float sum_tp1 = 0.0f;                    /* <t·p1,p1>，算 α2 用             */
+    float alpha1, alpha2 = 0.0f, beta2 = 0.0f;
+    float c0, c1 = 0.0f, c2 = 0.0f;
+    float rms = 0.0f, wsum = 0.0f;
+    float t_min = 0.0f, t_max = 0.0f;
+    uint8_t used = 0U;
+    uint8_t reached;
+    uint8_t i;
 
-    for (row = VISION_BASE_LINE; row < VISION_FORWARD_FAR; row++)
+    if ((t == 0) || (x == 0) || (w == 0) || (out == 0) || (n == 0U))
     {
-        float w = s_fit_weight[row];
-        float t, x;
+        return 0U;
+    }
 
-        if ((w <= 0.0f) || (s_fit_ok[row] == 0U))
+    /* ---------- 第 1 遍：p0 = 1 的范数与投影，顺带攒 α1 的分子 ---------- */
+    for (i = 0U; i < n; i++)
+    {
+        float wi = w[i];
+
+        if (wi <= 0.0f)
         {
             continue;
         }
 
-        t = ((float)row - FIT_T_CENTER) / FIT_T_SCALE;
-        x = s_fit_x[row];
-
-        s0 += w;
-        s1 += w * t;
-        s2 += w * t * t;
-        t0 += w * x;
-        t1 += w * t * x;
-        n++;
+        n0    += wi;
+        p0    += wi * x[i];
+        sum_t += wi * t[i];
+        used++;
     }
 
-    if (n_out != 0)
-    {
-        *n_out = n;
-    }
-    if (n < VISION_FIT_MIN_ROWS)
+    if ((used == 0U) || (n0 <= 0.0f))
     {
         return 0U;
     }
 
-    det = (s0 * s2) - (s1 * s1);
-    if ((det < 1.0e-6f) && (det > -1.0e-6f))
+    alpha1 = sum_t / n0;
+
+    /* ---------- 第 2 遍：p1 = t − α1 ---------- */
+    for (i = 0U; i < n; i++)
     {
+        float wi = w[i];
+        float ti, v;
+
+        if (wi <= 0.0f)
+        {
+            continue;
+        }
+
+        ti = t[i];
+        v  = ti - alpha1;
+
+        n1      += wi * v * v;
+        p1      += wi * x[i] * v;
+        sum_tp1 += wi * ti * v * v;
+    }
+
+    /* ---------- 第 3 遍：p2 = (t − α2)·p1 − β2（只在上一阶还撑得住时做） ---------- */
+    if ((order >= 2U) && (n1 > (n0 * VISION_FIT_ORTHO_MIN_REL)))
+    {
+        alpha2 = sum_tp1 / n1;
+        beta2  = n1 / n0;
+
+        for (i = 0U; i < n; i++)
+        {
+            float wi = w[i];
+            float ti, v;
+
+            if (wi <= 0.0f)
+            {
+                continue;
+            }
+
+            ti = t[i];
+            v  = ((ti - alpha2) * (ti - alpha1)) - beta2;
+
+            n2 += wi * v * v;
+            p2 += wi * x[i] * v;
+        }
+    }
+
+    /* ---------- 秩判定：范数塌了 = 这一阶没被数据撑住 ---------- */
+    reached = 0U;
+    if (n1 > (n0 * VISION_FIT_ORTHO_MIN_REL))
+    {
+        reached = 1U;
+    }
+    if ((order >= 2U) && (n2 > (n0 * VISION_FIT_ORTHO_MIN_REL)))
+    {
+        reached = 2U;
+    }
+
+    if (reached == 0U)
+    {
+        /* 所有有效样本落在同一个 t 上：连斜率都定不出来 */
+        out->order = 0U;
         return 0U;
     }
 
-    ab[0] = ((t0 * s2) - (t1 * s1)) / det;
-    ab[1] = ((t1 * s0) - (t0 * s1)) / det;
+    /* ---------- 投影系数 → 幂基系数 ---------- */
+    c0 = p0 / n0;
+    if (reached >= 1U)
+    {
+        c1 = p1 / n1;
+    }
+    if (reached >= 2U)
+    {
+        c2 = p2 / n2;
+    }
+
+    out->c = c2;
+    out->b = c1 - (c2 * (alpha1 + alpha2));
+    out->a = c0 - (c1 * alpha1) + (c2 * ((alpha1 * alpha2) - beta2));
+
+    /* ---------- 质量指标：加权内点残差 + 数据跨度 ---------- */
+    {
+        uint8_t first = 1U;
+
+        for (i = 0U; i < n; i++)
+        {
+            float wi = w[i];
+            float ti, r;
+
+            if (wi <= 0.0f)
+            {
+                continue;
+            }
+
+            ti = t[i];
+            r  = x[i] - (out->a + ((out->b + (out->c * ti)) * ti));
+
+            rms  += wi * r * r;
+            wsum += wi;
+
+            if (first != 0U)
+            {
+                t_min = ti;
+                t_max = ti;
+                first = 0U;
+            }
+            else
+            {
+                if (ti < t_min)
+                {
+                    t_min = ti;
+                }
+                if (ti > t_max)
+                {
+                    t_max = ti;
+                }
+            }
+        }
+    }
+
+    out->rms    = (wsum > 0.0f) ? sqrtf(rms / wsum) : 0.0f;
+    out->t_span = t_max - t_min;
+    out->order  = reached;
+    out->n_used = used;
 
     return 1U;
 }
 
 void Vision_FitPath(void)
 {
-    float   abc[3];
-    float   ab[2];
-    uint8_t n_line = 0U;
-    uint8_t n = 0U;
+    struct path_poly_s line;
+    struct path_poly_s quad;
+    struct path_poly_s poly;
+    float   t_look;
+    uint8_t i;
     int     row;
 
-    /* ---------- 1. 收集有效行 + 给基础权重 ---------- */
-    for (row = 0; row < VISION_IMG_HEIGHT; row++)
+    s_fit_n = 0U;
+
+    /* ---------- 1. 收集有效行，压缩成 (t, x, w) 样本 ---------- */
+    for (row = VISION_BASE_LINE; row < VISION_FORWARD_FAR; row++)
     {
         float t, at;
 
-        s_fit_ok[row]     = 0U;
-        s_fit_weight[row] = 0.0f;
-
-        if ((row < VISION_BASE_LINE) || (row >= VISION_FORWARD_FAR))
-        {
-            continue;
-        }
         if ((lineinfo[row].whole_lost != 0) ||
             (lineinfo[row].left_lost  != 0) ||
             (lineinfo[row].right_lost != 0))
         {
             continue;
         }
+        if (s_fit_n >= (uint8_t)FIT_MAX_SAMPLES)
+        {
+            break;
+        }
 
-        s_fit_ok[row] = 1U;
-        s_fit_x[row]  = ((float)lineinfo[row].left + (float)lineinfo[row].right) * 0.5f;
+        t  = (((float)row) - FIT_T_CENTER) / FIT_T_SCALE;
+        at = (t < 0.0f) ? -t : t;
+
+        s_fit_t[s_fit_n] = t;
+        s_fit_x[s_fit_n] = ((float)lineinfo[row].left + (float)lineinfo[row].right) * 0.5f;
 
         /* 权重随离控制行的距离衰减（近处更可信），
          * 但端点仍保留 62.5%，这样远处弯道的信息不会被压没。 */
-        t  = ((float)row - FIT_T_CENTER) / FIT_T_SCALE;
-        at = (t < 0.0f) ? -t : t;
-        s_fit_weight[row] = 1.0f / (1.0f + (FIT_WEIGHT_K * at));
+        s_fit_w[s_fit_n] = 1.0f / (1.0f + (FIT_WEIGHT_K * at));
+        s_fit_n++;
+    }
+
+    if (s_fit_n < VISION_FIT_MIN_ROWS)
+    {
+        Fit_ResetInvalid(s_fit_n);
+        return;
     }
 
     /* ======================================================================
@@ -553,71 +664,53 @@ void Vision_FitPath(void)
      *   一段连续的坏行（直角弯的垂直赛道、阴影、缺口，通常 10~20 行）
      *   会把第一遍的二次曲线"拉弯"，曲线恰好穿过这些坏行，
      *   于是它们的残差反而很小 —— 判据认为它们"正常"，第二遍原样保留。
-     *   这就是鲁棒回归里的 masking（掩蔽），表现为你看到的"曲率非常大的抛物线"。
+     *   这就是鲁棒回归里的 masking（掩蔽），表现为"曲率非常大的抛物线"。
      *
      *   直线只有 2 个自由度，连续的坏行只能让直线整体倾斜、不能让直线弯折，
      *   所以坏行在直线上的残差一定很大 —— 掩蔽效应被彻底绕开。
      * ====================================================================== */
-    if (Fit_SolveLineOnce(ab, &n_line) == 0U)
+    if ((Vision_FitPoly(s_fit_t, s_fit_x, s_fit_w, s_fit_n, 1U, &line) == 0U) ||
+        (line.n_used < VISION_FIT_MIN_ROWS))
     {
-        /* 有效行不足或退化：清空结果，让上层退回"只看控制行"的旧逻辑 */
-        path_fit.a          = (float)VISION_IMG_CX;
-        path_fit.b          = 0.0f;
-        path_fit.c          = 0.0f;
-        path_fit.x_ctrl     = (float)VISION_IMG_CX;
-        path_fit.x_look     = (float)VISION_IMG_CX;
-        path_fit.slope_ctrl = 0.0f;
-        path_fit.rows_used  = n_line;
-        path_fit.valid      = 0U;
+        Fit_ResetInvalid(s_fit_n);
         return;
     }
 
-    /* ---------- 2. 缓存每行对直线的绝对残差 ---------- */
-    for (row = VISION_BASE_LINE; row < VISION_FORWARD_FAR; row++)
-    {
-        float t_row;
-
-        if (s_fit_ok[row] == 0U)
-        {
-            s_fit_resid[row] = 0.0f;
-            continue;
-        }
-
-        t_row = ((float)row - FIT_T_CENTER) / FIT_T_SCALE;
-        s_fit_resid[row] = s_fit_x[row] - (ab[0] + (ab[1] * t_row));
-
-        if (s_fit_resid[row] < 0.0f)
-        {
-            s_fit_resid[row] = -s_fit_resid[row];
-        }
-    }
-
-    /* ---------- 3. 按**固定**门限把坏行权重清零 ----------
+    /* ---------- 2. 缓存不了残差也没关系：就地按**固定**门限清权重 ----------
      * 为什么是固定阈值而不是自适应倍数，见 vision_types.h 里的实测对照表：
      * 强弯场景要求门限 > 19px，坏块场景要求门限 < 32px，两者能同时满足；
      * 而任何 `K × 中位数` 都做不到（两个场景对 K 的要求方向相反）。 */
-    for (row = VISION_BASE_LINE; row < VISION_FORWARD_FAR; row++)
+    for (i = 0U; i < s_fit_n; i++)
     {
-        if (s_fit_ok[row] == 0U)
+        float r;
+
+        if (s_fit_w[i] <= 0.0f)
         {
             continue;
         }
 
-        if (s_fit_resid[row] > VISION_FIT_OUTLIER_PX)
+        r = s_fit_x[i] - (line.a + (line.b * s_fit_t[i]));
+        if ((r > VISION_FIT_OUTLIER_PX) || (r < -VISION_FIT_OUTLIER_PX))
         {
-            s_fit_weight[row] = 0.0f;
+            s_fit_w[i] = 0.0f;
         }
     }
 
-    /* ---------- 5. 用剩下的内点拟合二次曲线 ---------- */
-    if (Fit_SolveOnce(abc, &n) == 0U)
+    /* ---------- 3. 用内点拟合二次曲线 ----------
+     * 内点不足、或 t 跨度不足以支撑二次项时，Vision_FitPoly 会自己把
+     * order 降到 1（<p2,p2> 塌到门限下），此时 c 一定是 0，等价于直线结果。 */
+    if ((Vision_FitPoly(s_fit_t, s_fit_x, s_fit_w, s_fit_n, 2U, &quad) != 0U) &&
+        (quad.n_used >= VISION_FIT_MIN_ROWS))
+    {
+        poly = quad;
+    }
+    else
     {
         /* 筛完内点不够：退回直线结果（c = 0）。宁可没有曲率，
          * 也不能让一个解不出来的二次曲线污染偏移。 */
-        abc[0] = ab[0];
-        abc[1] = ab[1];
-        abc[2] = 0.0f;
-        n      = n_line;
+        poly      = line;
+        poly.c    = 0.0f;
+        poly.order = 1U;
     }
 
     /* ======================================================================
@@ -625,33 +718,35 @@ void Vision_FitPath(void)
      * ----------------------------------------------------------------------
      * 即使数据筛干净了，二次项仍可能被残差噪声顶到不合理的大小。
      * 这里把 |c| 夹到 VISION_FIT_MAX_SAGITTA_PX —— 曲线在图像上下端
-     * 最多比直线弯 20 像素，从源头禁掉"曲率非常大的抛物线"。
-     * 注意只夹 c，不动 a（= x_ctrl），所以**偏移不受影响**。
+     * 最多比直线弯 60 像素，从源头禁掉"曲率非常大的抛物线"。
+     * 注意只夹 c，不动 a（= x_ctrl），所以**偏移不受影响**；
+     * 但 x_look 用的是被夹过的 c，钳位生效时前视值只作参考、不应重信。
      * ====================================================================== */
-    if (abc[2] > VISION_FIT_MAX_SAGITTA_PX)
+    if (poly.c > VISION_FIT_MAX_SAGITTA_PX)
     {
-        abc[2] = VISION_FIT_MAX_SAGITTA_PX;
+        poly.c = VISION_FIT_MAX_SAGITTA_PX;
     }
-    else if (abc[2] < -VISION_FIT_MAX_SAGITTA_PX)
+    else if (poly.c < -VISION_FIT_MAX_SAGITTA_PX)
     {
-        abc[2] = -VISION_FIT_MAX_SAGITTA_PX;
+        poly.c = -VISION_FIT_MAX_SAGITTA_PX;
     }
 
-    /* ---------- 6. 填写结果 ----------
+    /* ---------- 4. 填写结果 ----------
      * 控制行处 t = 0，所以 x_ctrl = a；
      * 斜率 dx/drow = (b + 2c·t) / scale，在 t = 0 处即 b / scale。 */
-    path_fit.a          = abc[0];
-    path_fit.b          = abc[1];
-    path_fit.c          = abc[2];
-    path_fit.x_ctrl     = abc[0];
-    path_fit.slope_ctrl = abc[1] / FIT_T_SCALE;
+    path_fit.a          = poly.a;
+    path_fit.b          = poly.b;
+    path_fit.c          = poly.c;
+    path_fit.x_ctrl     = poly.a;
+    path_fit.slope_ctrl = poly.b / FIT_T_SCALE;
 
-    {
-        float t_look = ((float)VISION_LOOKAHEAD_ROW - FIT_T_CENTER) / FIT_T_SCALE;
-        path_fit.x_look = abc[0] + ((abc[1] + (abc[2] * t_look)) * t_look);
-    }
+    t_look = (((float)VISION_LOOKAHEAD_ROW) - FIT_T_CENTER) / FIT_T_SCALE;
+    path_fit.x_look = poly.a + ((poly.b + (poly.c * t_look)) * t_look);
 
-    path_fit.rows_used = n;
+    path_fit.resid_rms = poly.rms;
+    path_fit.t_span    = poly.t_span;
+    path_fit.order     = poly.order;
+    path_fit.rows_used = poly.n_used;
     path_fit.valid     = 1U;
 }
 
